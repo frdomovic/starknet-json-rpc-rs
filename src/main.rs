@@ -1,8 +1,12 @@
-use starknet_core::types::{BlockId, BlockTag, Felt, FunctionCall};
+use hex;
+use starknet_core::types::{
+    BlockId, BlockTag, BroadcastedInvokeTransaction, BroadcastedInvokeTransactionV1, Felt,
+    FunctionCall, InvokeTransactionV1,
+};
 use starknet_core::utils::get_selector_from_name;
+use starknet_crypto::{poseidon_hash_many, Signature};
 use starknet_providers::jsonrpc::HttpTransport;
 use starknet_providers::{JsonRpcClient, Provider, Url};
-
 use std::collections::BTreeMap;
 use std::{borrow::Cow, str::FromStr};
 use thiserror::Error;
@@ -52,6 +56,30 @@ impl<'a> StarknetTransport<'a> {
     }
 }
 
+fn compute_transaction_hash(
+    sender_address: Felt,
+    contract_address: Felt,
+    entry_point_selector: Felt,
+    calldata: Vec<Felt>,
+) -> Felt {
+    let elements: Vec<Felt> = vec![sender_address, contract_address, entry_point_selector]
+        .into_iter()
+        .chain(calldata.into_iter())
+        .collect();
+
+    poseidon_hash_many(&elements)
+}
+
+async fn sign_transaction(hash: &Felt, secret_key: &Felt) -> Result<Signature, StarknetError> {
+    let signature = starknet_core::crypto::ecdsa_sign(secret_key, hash);
+    match signature {
+        Ok(result) => Ok(result.into()),
+        Err(_) => Err(StarknetError::InvalidResponse {
+            operation: ErrorOperation::Query,
+        }),
+    }
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StarknetError {
@@ -96,6 +124,7 @@ impl Network {
     ) -> Result<Vec<Felt>, StarknetError> {
         let contract_id = Felt::from_str(contract_id)
             .unwrap_or_else(|_| panic!("Failed to convert contract id to felt type"));
+
         let entry_point_selector = get_selector_from_name(method)
             .unwrap_or_else(|_| panic!("Failed to convert method name to entry point selector"));
 
@@ -132,13 +161,82 @@ impl Network {
         }
     }
 
-    // async fn mutate(
-    //     &self,
-    //     contract_id: String,
-    //     method: String,
-    //     args: Vec<u8>,
-    // ) -> Result<Vec<u8>, StarknetError> {
-    // }
+    async fn mutate(&self, contract_id: &str, method: &str, args: Vec<u8>) {
+        let sender_address: Felt = Felt::from_str(self.account_id.as_str())
+            .unwrap_or_else(|_| panic!("Failed to convert sender address to felt type"));
+        let secret_key: Felt = Felt::from_str(self.secret_key.as_str())
+            .unwrap_or_else(|_| panic!("Failed to convert sender address to felt type"));
+
+        let nonce = self
+            .get_nonce(self.account_id.as_str())
+            .await
+            .unwrap_or_else(|_| panic!("Failed to get nonce"));
+
+        let contract_id = Felt::from_str(contract_id)
+            .unwrap_or_else(|_| panic!("Failed to convert contract id to felt type"));
+
+        let entry_point_selector = get_selector_from_name(method)
+            .unwrap_or_else(|_| panic!("Failed to convert method name to entry point selector"));
+
+        let calldata: Vec<Felt> = if args.is_empty() {
+            vec![]
+        } else {
+            args.chunks(32)
+                .map(|chunk| {
+                    let mut padded_chunk = [0u8; 32];
+                    for (i, byte) in chunk.iter().enumerate() {
+                        padded_chunk[i] = *byte;
+                    }
+                    Felt::from_bytes_be(&padded_chunk)
+                })
+                .collect()
+        };
+
+        let transaction_hash = compute_transaction_hash(
+            sender_address,
+            contract_id,
+            entry_point_selector,
+            calldata.clone(),
+        );
+
+        let signature = sign_transaction(&transaction_hash, &secret_key)
+            .await
+            .unwrap();
+
+        let signature_vec: Vec<Felt> = vec![signature.r, signature.s];
+
+        let invoke_transaction = InvokeTransactionV1 {
+            transaction_hash,
+            sender_address,
+            calldata,
+            max_fee: Felt::from(304139049569u64),
+            signature: signature_vec,
+            nonce,
+        };
+
+        let invoke_transaction_v1 = BroadcastedInvokeTransactionV1 {
+            sender_address: invoke_transaction.sender_address,
+            calldata: invoke_transaction.calldata,
+            max_fee: invoke_transaction.max_fee,
+            signature: invoke_transaction.signature,
+            nonce: invoke_transaction.nonce,
+            is_query: false, // Set this to true if it's a query-only transaction
+        };
+        let broadcasted_transaction = BroadcastedInvokeTransaction::V1(invoke_transaction_v1);
+
+        let response = self
+            .client
+            .add_invoke_transaction(&broadcasted_transaction)
+            .await;
+        match response {
+            Ok(result) => {
+                println!("Transaction successful: {:?}", result);
+            }
+            Err(err) => {
+                eprintln!("Error adding invoke transaction: {:?}", err);
+            }
+        }
+    }
 
     async fn get_nonce(&self, contract_id: &str) -> Result<Felt, StarknetError> {
         let contract_id = Felt::from_str(contract_id)
@@ -160,7 +258,7 @@ impl Network {
 
 #[tokio::main]
 async fn main() {
-    let rpc_url = Url::parse("https://free-rpc.nethermind.io/mainnet-juno/")
+    let rpc_url = Url::parse("https://free-rpc.nethermind.io/sepolia-juno/")
         .expect("Invalid Starknet RPC URL");
 
     let network_config = NetworkConfig {
@@ -184,82 +282,69 @@ async fn main() {
         .get("sepolia")
         .expect("Failed to get the network configuration");
 
-    let contract_id = "0x124aeb495b947201f5fac96fd1138e326ad86195b98df6dec9009158a533b49";
-    let method = "name";
-    let args: Vec<u8> = vec![];
+    let contract_id = "0x07e2bb02aef8f8cb6851e605d814cf77fe930c812fcc22c851d94ff567341c45";
+    let acc = "0x0782897323eb2eeea09bd4c9dd0c6cc559b9452cdddde4dd26b9bbe564411703";
 
-    match network.query(contract_id, method, args).await {
-        Ok(result) => {
-            println!("Query succeeded with result: {:?}", result);
-        }
-        Err(e) => {
-            println!("Query failed with error: {:?}", e);
-        }
-    }
-    match network.get_nonce(contract_id).await {
-        Ok(result) => {
-            println!("Query succeeded with result: {:?}", result);
-        }
-        Err(e) => {
-            println!("Query failed with error: {:?}", e);
-        }
-    }
+    let method = "name";
+
+    let acc = acc.trim_start_matches("0x");
+
+    let account_bytes = hex::decode(acc).expect("Failed to decode hex string");
+
+    let args: Vec<u8> = account_bytes;
+
+    // match network.query(contract_id, method, args.clone()).await {
+    //     Ok(result) => {
+    //         println!("{:?}", result);
+    //     }
+    //     Err(e) => {
+    //         println!("Query failed with error: {:?}", e);
+    //     }
+    // }
+    network.mutate(contract_id, method, args).await;
+
+    // match network.mutate(contract_id, method, args).await {
+    //     Ok(result) => {
+    //         println!("{:?}", result);
+    //     }
+    //     Err(e) => {
+    //         println!("Query failed with error: {:?}", e);
+    //     }
+    // }
 }
 
-// query, mutate, getnonce
+//CONVERT FELT TO STRING / DECIMAL - DOESN'T WORK FOR JSON STRINGS
+// fn felt_to_short_string(value: Felt) -> String {
+//     let mut chars = Vec::new();
 
-// getNonce
-// let result = provider
-//     .get_nonce(BlockId::Tag(BlockTag::Latest), felt!("0xCONTRACT_ADDRS"))
-//     .await;
-//   match result {
-//     Ok(nonce) => {
-//       println!("{nonce:#?}");
+//     let mut value_bytes: Vec<u8> = value.to_bytes_be().to_vec();
+
+//     while value_bytes.first() == Some(&0) {
+//         value_bytes.remove(0);
 //     }
-//     Err(err) => {
-//       eprintln!("Error: {err}");
+
+//     let felt_value = value.to_string();
+//     if felt_value.starts_with("0x") && felt_value.len() >= 40 {
+//         return format!("Contract Address: {}", felt_value);
 //     }
-//   }
 
-// contract_id: AccountId,
-// method: String,
-// args: Vec<u8>,
+//     let mut is_string = true;
 
-// #[derive(Debug, Serialize, Deserialize)]
-// #[expect(clippy::exhaustive_enums, reason = "Considered to be exhaustive")]
-// pub enum Operation<'a> {
-//     Read { method: Cow<'a, str> },
-//     Write { method: Cow<'a, str> },
-// }
-
-// impl Transport for StarknetTransport<'_> {
-//     type Error = StarknetError;
-
-//     async fn send(
-//         &self,
-//         request: TransportRequest<'_>,
-//         payload: Vec<u8>,
-//     ) -> Result<Vec<u8>, Self::Error> {
-//         let Some(network) = self.networks.get(&request.network_id) else {
-//             return Err(StarknetError::UnknownNetwork(request.network_id.into_owned()));
-//         };
-
-//         let contract_id = request
-//             .contract_id
-//             .parse()
-//             .map_err(StarknetError::InvalidContractId)?;
-
-//         match request.operation {
-//             Operation::Read { method } => {
-//                 network
-//                     .query(contract_id, method.into_owned(), payload)
-//                     .await
+//     for &byte in &value_bytes {
+//         if byte >= 0x20 && byte <= 0x7E {
+//             if let Some(character) = std::char::from_u32(byte as u32) {
+//                 chars.push(character);
 //             }
-//             Operation::Write { method } => {
-//                 network
-//                     .mutate(contract_id, method.into_owned(), payload)
-//                     .await
-//             }
+//         } else {
+//             is_string = false;
+//             break;
 //         }
+//     }
+
+//     if is_string {
+//         let result_string: String = chars.into_iter().collect();
+//         return result_string;
+//     } else {
+//         format!("Decimal: {}, Hex: 0x{:x}", value.to_string(), value)
 //     }
 // }
